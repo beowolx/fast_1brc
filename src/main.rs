@@ -1,21 +1,21 @@
 #![feature(portable_simd)]
 
+use crossbeam::thread;
+use fast_float::parse as fast_parse_float;
+use fxhash::FxBuildHasher;
+use memchr::memrchr;
+use std::simd::prelude::SimdPartialEq;
+use std::simd::Simd;
 use std::{
     collections::HashMap,
     fs::File,
-    io,
+    io::{self, BufWriter, Write},
     os::unix::fs::FileExt,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
-
-use crossbeam::thread;
-use fxhash::FxBuildHasher;
-use memchr::memrchr;
-use std::simd::prelude::SimdPartialEq;
-use std::simd::Simd;
 
 const CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 const CHUNK_OVERLAP: u64 = 64;
@@ -67,8 +67,7 @@ impl Records {
 }
 
 fn parse_temp(bytes: &[u8]) -> Option<f64> {
-    let temp_str = std::str::from_utf8(bytes).ok()?;
-    temp_str.trim().parse::<f64>().ok()
+    fast_parse_float(bytes).ok()
 }
 
 fn process_chunk<'a>(chunk: &'a [u8]) -> fxhash::FxHashMap<&'a [u8], Records> {
@@ -162,33 +161,40 @@ fn process_file_parallel(filename: &str) -> io::Result<HashMap<String, Records, 
                         std::cmp::min(CHUNK_SIZE + CHUNK_OVERLAP, file_size - read_start);
                     let buffer = &mut buffer[..read_size as usize];
 
-                    if let Err(e) = file.read_exact_at(buffer, read_start) {
-                        eprintln!("Error reading file at position {}: {}", read_start, e);
-                        break;
-                    }
+                    match file.read_at(buffer, read_start) {
+                        Ok(bytes_read) if bytes_read == read_size as usize => {
+                            let mut chunk = &buffer[..];
+                            if chunk_start != 0 {
+                                if let Some(pos) = memrchr(b'\n', chunk) {
+                                    chunk = &chunk[pos + 1..];
+                                } else {
+                                    continue;
+                                }
+                            }
 
-                    let mut chunk = &buffer[..];
-                    if chunk_start != 0 {
-                        if let Some(pos) = memrchr(b'\n', chunk) {
-                            chunk = &chunk[pos + 1..];
-                        } else {
-                            continue;
+                            if let Some(pos) = memrchr(b'\n', chunk) {
+                                chunk = &chunk[..pos];
+                            }
+
+                            let local_map = process_chunk(chunk);
+
+                            let mut global_map = global_map.lock().unwrap();
+                            for (station_bytes, records) in local_map {
+                                let station = String::from_utf8_lossy(station_bytes).to_string();
+                                global_map
+                                    .entry(station)
+                                    .and_modify(|e: &mut Records| e.merge(&records))
+                                    .or_insert(records);
+                            }
                         }
-                    }
-
-                    if let Some(pos) = memrchr(b'\n', chunk) {
-                        chunk = &chunk[..pos];
-                    }
-
-                    let local_map = process_chunk(chunk);
-
-                    let mut global_map = global_map.lock().unwrap();
-                    for (station_bytes, records) in local_map {
-                        let station = String::from_utf8_lossy(station_bytes).to_string();
-                        global_map
-                            .entry(station)
-                            .and_modify(|e: &mut Records| e.merge(&records))
-                            .or_insert(records);
+                        Ok(_) => {
+                            eprintln!("Unexpected end of file at position {}", read_start);
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading file at position {}: {}", read_start, e);
+                            break;
+                        }
                     }
                 }
             });
@@ -212,16 +218,22 @@ fn main() -> io::Result<()> {
     let mut stations: Vec<_> = stats_map.keys().collect();
     stations.sort_unstable();
 
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+
     for station in stations {
         let stats = &stats_map[station];
-        println!(
+        writeln!(
+            writer,
             "{};{:.1};{:.1};{:.1}",
             station,
             stats.min,
             stats.mean(),
             stats.max
-        );
+        )?;
     }
+
+    writer.flush()?;
 
     Ok(())
 }
