@@ -21,4 +21,7 @@ resolver = "2"
 package = { publish = false, edition = "2021" }
 
 [profile.release]
-debug = true
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
