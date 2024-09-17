@@ -20,8 +20,10 @@ use std::{
 const CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 const CHUNK_OVERLAP: u64 = 64;
 
-use jemallocator::Jemalloc;
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
 
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 

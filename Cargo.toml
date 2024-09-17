@@ -7,10 +7,18 @@ edition = "2021"
 crossbeam = "0.8.4"
 fast-float = "0.2.0"
 fxhash = "0.2.1"
-jemallocator = "0.5.4"
 memchr = "2.7.4"
 num_cpus = "1.16.0"
+tikv-jemallocator = "0.6.0"
 
 [features]
 default = []
 simd = []
+
+[workspace]
+members = ["generate-dataset"]
+resolver = "2"
+package = { publish = false, edition = "2021" }
+
+[profile.release]
+debug = true
