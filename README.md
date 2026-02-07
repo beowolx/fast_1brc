@@ -114,3 +114,7 @@ Recent runs (after short cooldown):
 - `4.13s`
 
 Median: `4.13s`
+
+### Flamegraph
+
+![Flamegraph for fast_1brc](./flamegraph.png)
