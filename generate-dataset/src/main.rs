@@ -1,10 +1,8 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::Arc;
-
-use crossbeam::channel;
-use fastrand::Rng;
-use rayon::prelude::*;
+use std::num::NonZeroUsize;
+use std::sync::mpsc;
+use std::thread;
 
 const CITY_DATA: &[(&str, f64)] = &[
     ("Abha", 18.0),
@@ -425,61 +423,182 @@ const CITY_COUNT: usize = CITY_DATA.len();
 const STANDARD_DEVIATION: f64 = 10.0;
 const BUFFER_CAPACITY: usize = 1000;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Clone)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    const fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn next_usize(&mut self, upper_bound: usize) -> usize {
+        if upper_bound == 0 {
+            return 0;
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (self.next_u64() % (upper_bound as u64)) as usize
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn next_f64(&mut self) -> f64 {
+        let value = self.next_u64() >> 11;
+        (value as f64) * (1.0 / 9_007_199_254_740_992.0)
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn append_unsigned(buffer: &mut Vec<u8>, mut value: u32) {
+    let mut scratch = [0u8; 10];
+    let mut index = scratch.len();
+
+    loop {
+        let digit = (value % 10) as u8;
+        index -= 1;
+        scratch[index] = b'0' + digit;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+
+    buffer.extend_from_slice(&scratch[index..]);
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn round_tenths(value: f64) -> i32 {
+    if value >= 0.0 {
+        value.mul_add(10.0, 0.5) as i32
+    } else {
+        value.mul_add(10.0, -0.5) as i32
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn append_measurement(buffer: &mut Vec<u8>, city: &str, measurement: f64) {
+    buffer.extend_from_slice(city.as_bytes());
+    buffer.push(b';');
+
+    let mut tenths = round_tenths(measurement);
+    if tenths < 0 {
+        buffer.push(b'-');
+        tenths = -tenths;
+    }
+
+    let integer_part = (tenths / 10) as u32;
+    let fraction = (tenths % 10) as u8;
+    append_unsigned(buffer, integer_part);
+    buffer.push(b'.');
+    buffer.push(b'0' + fraction);
+    buffer.push(b'\n');
+}
+
+fn generate_worker(
+    line_count: usize,
+    worker_index: usize,
+    sender: &mpsc::SyncSender<Vec<u8>>,
+) -> std::io::Result<()> {
+    let worker_seed = u64::try_from(worker_index)
+        .map_or(1, |value| value.saturating_add(1))
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut rng = SplitMix64::new(worker_seed);
+    let mut buffer = Vec::with_capacity(BUFFER_CAPACITY * 24);
+
+    for _ in 0..line_count {
+        let random_city_index = rng.next_usize(CITY_COUNT);
+        let (city, temperature) = CITY_DATA[random_city_index];
+        let measurement = rng
+            .next_f64()
+            .mul_add(2.0, -1.0)
+            .mul_add(STANDARD_DEVIATION, temperature);
+        append_measurement(&mut buffer, city, measurement);
+
+        if buffer.len() >= BUFFER_CAPACITY * 24 {
+            sender.send(std::mem::take(&mut buffer)).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer thread closed before receiving data",
+                )
+            })?;
+        }
+    }
+
+    if !buffer.is_empty() {
+        sender.send(buffer).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "writer thread closed before receiving data",
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn main() -> std::io::Result<()> {
     let start_time = std::time::Instant::now();
+    let number_arg = std::env::args().nth(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "usage: generate-dataset <number-of-lines>",
+        )
+    })?;
+    let number = number_arg.parse::<usize>().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid number of lines: {error}"),
+        )
+    })?;
 
-    let number = std::env::args()
-        .nth(1)
-        .expect("usage: generate-dataset <number-of-lines>")
-        .parse::<usize>()?;
+    let worker_count = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let lines_per_worker = number / worker_count;
+    let extra_lines = number % worker_count;
 
-    let (sender, receiver) = channel::bounded::<Vec<u8>>(100);
-    let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
+    let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(128);
+    let writer_handle = thread::spawn(move || -> std::io::Result<()> {
         let measurements_file = File::create("measurements.txt")?;
         let mut measurements_file = BufWriter::new(measurements_file);
-        for data in receiver.iter() {
-            if data.is_empty() {
-                break;
-            }
+        for data in receiver {
             measurements_file.write_all(&data)?;
         }
         measurements_file.flush()?;
         Ok(())
     });
 
-    let city_data = Arc::new(CITY_DATA);
+    thread::scope(|scope| -> std::io::Result<()> {
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let sender = sender.clone();
+            let line_count = lines_per_worker + usize::from(worker_index < extra_lines);
+            workers.push(scope.spawn(move || generate_worker(line_count, worker_index, &sender)));
+        }
 
-    (0..number)
-        .into_par_iter()
-        .fold(
-            || {
-                let rng = Rng::new();
-                let buffer = Vec::with_capacity(BUFFER_CAPACITY * 20);
-                (rng, buffer)
-            },
-            |(mut rng, mut buffer), _| {
-                let random_city_index = rng.usize(0..CITY_COUNT);
-                let (city, temperature) = city_data[random_city_index];
-                let measurement = temperature + (rng.f64() * 2.0 - 1.0) * STANDARD_DEVIATION;
+        drop(sender);
 
-                buffer.extend_from_slice(format!("{};{:.1}\n", city, measurement).as_bytes());
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("generator worker panicked"))??;
+        }
 
-                if buffer.len() >= BUFFER_CAPACITY * 20 {
-                    sender.send(std::mem::take(&mut buffer)).unwrap();
-                }
+        Ok(())
+    })?;
 
-                (rng, buffer)
-            },
-        )
-        .for_each(|(_, mut buffer)| {
-            if !buffer.is_empty() {
-                sender.send(std::mem::take(&mut buffer)).unwrap();
-            }
-        });
-
-    sender.send(Vec::new()).unwrap();
-
-    writer_handle.join().unwrap()?;
+    writer_handle
+        .join()
+        .map_err(|_| std::io::Error::other("writer thread panicked"))??;
 
     println!("Generated {} lines in {:?}", number, start_time.elapsed());
 

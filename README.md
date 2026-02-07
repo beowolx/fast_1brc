@@ -1,181 +1,116 @@
-# Fast 1BRC
+# Fast 1BRC (Rust, std-only)
 
 ## Overview
 
-This is my solution to [The One Billion Row Challenge](https://github.com/gunnarmorling/1brc) which consists of processing a file with one billion rows.
-Each row consists of a weather station name and a temperature reading. The goal is to compute the minimum, mean, and maximum temperatures for each weather station and output the results in an alphabetically ordered format.
+This repository contains a Rust implementation of [The One Billion Row Challenge](https://github.com/gunnarmorling/1brc).
 
-## Performance
+Input format:
 
-| **Platform**                        | **User Time** | **System Time** | **CPU Usage** | **Total Time** |
-| ----------------------------------- | ------------- | --------------- | ------------- | -------------- |
-| MacBook PRO, M1 Pro 2021, 32 GB RAM | 0.07s         | 3.49s           | 308%          | 1.155s         |
-| MacBook PRO, M1 Pro 2020, 16 GB RAM | 0.04s         | 3.20s           | 39%           | 8.187s         |
+```text
+<station-name>;<temperature-with-1-decimal>
+```
 
-## Flamegraph
+Output format:
 
-![Flamegraph](flamegraph.svg)
+```text
+<station-name>;<min>;<mean>;<max>
+```
 
-## Getting Started
+Stations are emitted in alphabetical order.
 
-### 1. Generate the Dataset
+## Challenge Compliance
 
-To create the required dataset for the challenge, execute the following command:
+The workspace is now fully standard-library-only.
+
+- `fast_1brc`: no external crates
+- `generate-dataset`: no external crates
+
+Validation command:
+
+```bash
+cargo tree -e normal
+```
+
+Expected output is only workspace packages (`fast_1brc` and `generate-dataset`) with no third-party dependencies.
+
+## Quick Start
+
+### 1. Generate the benchmark dataset
 
 ```bash
 cargo run --release --package generate-dataset 1000000000
 ```
 
-- **Description:** Compiles and runs the `generate-dataset` package in release mode, generating a `measurements.txt` file containing **1,000,000,000** temperature records.
-- **Output Format:**
-  ```
-  Hamburg;12.0
-  Bulawayo;8.9
-  Palembang;38.8
-  Hamburg;34.2
-  St. John's;15.2
-  Cracow;12.6
-  ... etc. ...
-  ```
+This produces `measurements.txt` in the repo root.
 
-### 2. Run the Processor
-
-After generating the dataset, build and execute the temperature processor using the following command:
+### 2. Run the processor
 
 ```bash
-cargo build --release && time target/release/fast_1brc
+cargo build --release
+/usr/bin/time -p target/release/fast_1brc >/dev/null
 ```
 
-## Technical Implementation
+### 3. Optional tuning knobs
 
-### 1. Chunk-Based File Reading
+- `FAST_1BRC_THREADS` (default: `available_parallelism()`)
+- `FAST_1BRC_CHUNK_MB` (default: `4`)
 
-- **Chunk Size:** The input file `measurements.txt` is partitioned into **16 MB** chunks (`CHUNK_SIZE = 16 * 1024 * 1024`).
-- **Chunk Overlap:** To handle lines that span across chunks, each chunk includes an overlap of **64 bytes** (`CHUNK_OVERLAP = 64`).
-- **File Access:** Utilizes `FileExt::read_at` for concurrent, thread-safe reads of specific file segments, enabling parallel processing without seeking conflicts.
+Example:
 
-### 2. Parallel Processing with Crossbeam
+```bash
+FAST_1BRC_THREADS=10 FAST_1BRC_CHUNK_MB=4 target/release/fast_1brc
+```
 
-- **Thread Management:** Employs the `crossbeam` crate to create scoped threads, dynamically matching the number of available CPU cores (`num_cpus::get()`).
-- **Work Distribution:** An `AtomicU64` (`offset`) manages the distribution of file read offsets, ensuring each thread processes a unique file segment without overlap, except for the intentional `CHUNK_OVERLAP`.
+## Implementation Notes
 
-### 3. SIMD Optimization for Newline Detection
+### Processor (`src/main.rs`)
 
-- **SIMD Utilization:** Implements Rust's SIMD capabilities via the `std::simd` module to accelerate the detection of newline characters (`\n`).
-- **Functionality:** The `find_next_newline_simd` function processes the buffer in 64-byte SIMD vectors, performing parallel comparisons to locate newline characters efficiently. If no newline is found within the SIMD-processed block, it falls back to scalar byte-by-byte scanning for the remaining data.
+- Uses `FileExt::read_at` to read independent file chunks in parallel.
+- Adds overlap between chunks and trims boundaries at newline to avoid double-counting or truncation.
+- Assigns contiguous chunk ranges per worker to keep disk access more sequential.
+- Parses temperatures as fixed-point tenths (`i16`) to avoid floating-point parsing in the hot path.
+- Aggregates per-thread stats in local maps, then merges into a global map.
+- Uses an in-file `FxHasher64` implementation via `BuildHasherDefault`.
+- Sorts final station keys and prints `min/mean/max` with one decimal.
 
-  ```rust
-  fn find_next_newline_simd(buffer: &[u8]) -> Option<usize> {
-      let mut index = 0;
-      let simd_size = 64;
+## Correctness
 
-      while index + simd_size <= buffer.len() {
-          let bytes = Simd::<u8, 64>::from_slice(&buffer[index..index + simd_size]);
-          let mask = bytes.simd_eq(Simd::splat(b'\n'));
-          let bits = mask.to_bitmask();
+Checked with:
 
-          if bits != 0 {
-              let pos = bits.trailing_zeros() as usize;
-              return Some(index + pos);
-          }
+- Official upstream `1brc` sample suite via `test.sh` and `tocsv.sh` normalization.
+- Real-data output hash match against a previously validated output.
 
-          index += simd_size;
-      }
+To reproduce the official sample validation:
 
-      for i in index..buffer.len() {
-          if buffer[i] == b'\n' {
-              return Some(i);
-          }
-      }
+```bash
+cargo build --release
 
-      None
-  }
-  ```
+git clone --depth 1 https://github.com/gunnarmorling/1brc.git /tmp/onebrc_upstream
+cat >/tmp/onebrc_upstream/calculate_average_fast1brc.sh <<SH
+#!/bin/sh
+exec "$(pwd)/target/release/fast_1brc"
+SH
+chmod +x /tmp/onebrc_upstream/calculate_average_fast1brc.sh
 
-### 4. Parsing and Aggregation
+/tmp/onebrc_upstream/test.sh fast1brc 'src/test/resources/samples/*.txt'
+```
 
-- **Temperature Parsing:** Utilizes the `fast_float` crate to convert temperature byte slices to `f64` values rapidly through the `parse_temp` function.
+Expected result: all sample files validate without diffs (currently `12/12` passing).
 
-  ```rust
-  fn parse_temp(bytes: &[u8]) -> Option<f64> {
-      fast_parse_float(bytes).ok()
-  }
-  ```
+## Benchmark Snapshot
 
-- **Chunk Processing:** The `process_chunk` function iterates through each line within a chunk, parsing the station name and temperature, and aggregates the data using a local `FxHashMap`.
+Machine: macOS (Apple Silicon), real `measurements.txt` (~1B rows, generated with `generate-dataset`)
 
-  ```rust
-  fn process_chunk<'a>(chunk: &'a [u8]) -> fxhash::FxHashMap<&'a [u8], Records> {
-      let mut map: fxhash::FxHashMap<&'a [u8], Records> = fxhash::FxHashMap::default();
+Command:
 
-      let mut start = 0;
-      let len = chunk.len();
+```bash
+/usr/bin/time -p target/release/fast_1brc >/dev/null
+```
 
-      while start < len {
-          let end = match find_next_newline_simd(&chunk[start..]) {
-              Some(pos) => start + pos,
-              None => len,
-          };
+Recent runs (after short cooldown):
 
-          let line = &chunk[start..end];
-          if let Some(pos) = memchr::memchr(b';', line) {
-              let station = &line[..pos];
-              let temp_bytes = &line[pos + 1..];
+- `4.22s`
+- `4.09s`
+- `4.13s`
 
-              if let Some(temp) = parse_temp(temp_bytes) {
-                  map.entry(station)
-                      .and_modify(|e| e.update(temp))
-                      .or_insert_with(|| Records::new(temp));
-              }
-          }
-
-          start = end + 1;
-      }
-
-      map
-  }
-  ```
-
-### 5. Concurrent Data Aggregation
-
-- **Global Aggregation Map:** An `Arc<Mutex<HashMap<String, Records, FxBuildHasher>>>` serves as the thread-safe global hash map for aggregating results from all threads.
-
-  ```rust
-  let global_map = Arc::new(Mutex::new(HashMap::with_hasher(FxBuildHasher::default())));
-  ```
-
-- **Merging Local Maps:** Each thread maintains a local `FxHashMap` during chunk processing. After processing, the local map is merged into the global map within a mutex-protected block to ensure thread safety.
-
-  ```rust
-  let mut global_map = global_map.lock().unwrap();
-  for (station_bytes, records) in local_map {
-      let station = String::from_utf8_lossy(station_bytes).to_string();
-      global_map
-          .entry(station)
-          .and_modify(|e: &mut Records| e.merge(&records))
-          .or_insert(records);
-  }
-  ```
-
-### 6. Memory Allocation with Jemalloc
-
-- **Allocator Configuration:** Integrates `tikv_jemallocator` as the global memory allocator to optimize allocation patterns, particularly beneficial for the high-throughput, multi-threaded nature of the application.
-
-  ```rust
-  #[cfg(not(target_env = "msvc"))]
-  use tikv_jemallocator::Jemalloc;
-
-  #[cfg(not(target_env = "msvc"))]
-  #[global_allocator]
-  static GLOBAL: Jemalloc = Jemalloc;
-  ```
-
-### 7. Processing Workflow
-
-1. **File Initialization:** Opens `measurements.txt` and retrieves its size to determine the total number of chunks.
-2. **Thread Spawning:** Creates threads equal to the number of CPU cores available.
-3. **Chunk Reading:** Each thread reads assigned chunks with overlap handling to ensure complete line reads.
-4. **Line Parsing:** Utilizes SIMD-optimized newline detection to identify and parse each line within the chunk.
-5. **Data Aggregation:** Updates local `FxHashMap` instances with temperature statistics for each station.
-6. **Global Aggregation:** Merges local maps into the global hash map under mutex protection.
-7. **Result Compilation:** After all chunks are processed, the program sorts station names alphabetically and outputs the aggregated statistics.
+Median: `4.13s`
