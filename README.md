@@ -1,181 +1,39 @@
 # Fast 1BRC
 
-## Overview
+A Rust implementation of the [One Billion Row Challenge](https://github.com/gunnarmorling/1brc), processing **one billion rows in 0.2335 seconds** with no external libraries. The solver follows the challenge's input and output rules, lives in one source file, and runs on 64-bit Linux and macOS.
 
-This is my solution to [The One Billion Row Challenge](https://github.com/gunnarmorling/1brc) which consists of processing a file with one billion rows.
-Each row consists of a weather station name and a temperature reading. The goal is to compute the minimum, mean, and maximum temperatures for each weather station and output the results in an alphabetically ordered format.
+## Run
+
+```sh
+cargo build --release --workspace
+./target/release/generate-dataset 1000000000 measurements.txt 42
+./target/release/fast_1brc measurements.txt
+```
+
+Skip generation if you already have a dataset. One billion rows need about 14 GB of disk space.
 
 ## Performance
 
-| **Platform**                        | **User Time** | **System Time** | **CPU Usage** | **Total Time** |
-| ----------------------------------- | ------------- | --------------- | ------------- | -------------- |
-| MacBook PRO, M1 Pro 2021, 32 GB RAM | 0.07s         | 3.49s           | 308%          | 1.155s         |
-| MacBook PRO, M1 Pro 2020, 16 GB RAM | 0.04s         | 3.20s           | 39%           | 8.187s         |
+The **0.2335 s** result is **27.7% below the published 0.323 s Java bonus winner**. The implementations below were measured on different hardware and inputs.
 
-## Flamegraph
+| Implementation | Time | Hardware |
+| --- | ---: | --- |
+| **fast_1brc (Rust)** | **0.2335 s** | Ryzen 9 9950X3D, 16 cores / 32 threads |
+| [jerrinot (Java)](https://www.morling.dev/blog/1brc-results-are-in/#_bonus_result_32_cores_64_threads) | 0.323 s | EPYC 7502P, 32 cores / 64 threads |
+| [thomaswue (Java)](https://www.morling.dev/blog/1brc-results-are-in/#_bonus_result_32_cores_64_threads) | 0.326 s | EPYC 7502P, 32 cores / 64 threads |
+| [arthurlm (Rust)](https://github.com/arthurlm/one-brc-rs#my-implementation-results) | 0.810 s | Ryzen 9 7950X, 16 cores / 32 threads, WSL2 |
+| [Ragnar Groot Koerkamp (Rust)](https://curiouscoding.nl/posts/1brc/) | 0.900 s | i7-10750H, 6 cores, 4.6 GHz |
 
-![Flamegraph](flamegraph.svg)
+The fast_1brc result uses 32 workers, 64 GB DDR5-6000, and a warm file cache, built with Rust 1.98.1 and native CPU optimizations. It is the mean of nine runs after discarding the fastest and slowest, including startup, output, and process cleanup. Competitor times are their published results; timing boundaries vary, with Ragnar's excluding exit and unmapping.
 
-## Getting Started
+## Implementation
 
-### 1. Generate the Dataset
+Every row needs a station lookup before its temperature can update a total. On x86-64, a 16-byte scan finds the semicolon and CRC32 chooses a table slot. The primary table keeps the first 16 name bytes beside the statistics, so short names can be checked without following a pointer to another string. Longer names and collisions still get full comparisons.
 
-To create the required dataset for the challenge, execute the following command:
+Temperatures have only four layouts: `d.d`, `dd.d`, `-d.d`, and `-dd.d`. AVX2 converts two temperatures at once while checking every digit. Prefetching the station slots before this arithmetic gives their cache lines time to arrive. SSSE3 and BMI2 handle unpaired rows. Values stay in integer tenths, and SSE4.1 updates packed statistics with 64-bit sums. CPUs without these instructions use scalar fallbacks. The paired parser and prefetching adapt ideas from [Noah Falk’s implementation](https://github.com/noahfalk/1brc).
 
-```bash
-cargo run --release --package generate-dataset 1000000000
-```
+On Linux, each worker maps 16 MiB at a time, processes it in 1 MiB chunks, and releases the mapping before claiming another window. Each chunk has two interleaved input streams for the paired parser. Workers own their station tables, keeping locks out of per-row updates. The tables are merged once before sorting and formatting the result.
 
-- **Description:** Compiles and runs the `generate-dataset` package in release mode, generating a `measurements.txt` file containing **1,000,000,000** temperature records.
-- **Output Format:**
-  ```
-  Hamburg;12.0
-  Bulawayo;8.9
-  Palembang;38.8
-  Hamburg;34.2
-  St. John's;15.2
-  Cracow;12.6
-  ... etc. ...
-  ```
+[![CPU flamegraph](flamegraph.svg)](flamegraph.svg)
 
-### 2. Run the Processor
-
-After generating the dataset, build and execute the temperature processor using the following command:
-
-```bash
-cargo build --release && time target/release/fast_1brc
-```
-
-## Technical Implementation
-
-### 1. Chunk-Based File Reading
-
-- **Chunk Size:** The input file `measurements.txt` is partitioned into **16 MB** chunks (`CHUNK_SIZE = 16 * 1024 * 1024`).
-- **Chunk Overlap:** To handle lines that span across chunks, each chunk includes an overlap of **64 bytes** (`CHUNK_OVERLAP = 64`).
-- **File Access:** Utilizes `FileExt::read_at` for concurrent, thread-safe reads of specific file segments, enabling parallel processing without seeking conflicts.
-
-### 2. Parallel Processing with Crossbeam
-
-- **Thread Management:** Employs the `crossbeam` crate to create scoped threads, dynamically matching the number of available CPU cores (`num_cpus::get()`).
-- **Work Distribution:** An `AtomicU64` (`offset`) manages the distribution of file read offsets, ensuring each thread processes a unique file segment without overlap, except for the intentional `CHUNK_OVERLAP`.
-
-### 3. SIMD Optimization for Newline Detection
-
-- **SIMD Utilization:** Implements Rust's SIMD capabilities via the `std::simd` module to accelerate the detection of newline characters (`\n`).
-- **Functionality:** The `find_next_newline_simd` function processes the buffer in 64-byte SIMD vectors, performing parallel comparisons to locate newline characters efficiently. If no newline is found within the SIMD-processed block, it falls back to scalar byte-by-byte scanning for the remaining data.
-
-  ```rust
-  fn find_next_newline_simd(buffer: &[u8]) -> Option<usize> {
-      let mut index = 0;
-      let simd_size = 64;
-
-      while index + simd_size <= buffer.len() {
-          let bytes = Simd::<u8, 64>::from_slice(&buffer[index..index + simd_size]);
-          let mask = bytes.simd_eq(Simd::splat(b'\n'));
-          let bits = mask.to_bitmask();
-
-          if bits != 0 {
-              let pos = bits.trailing_zeros() as usize;
-              return Some(index + pos);
-          }
-
-          index += simd_size;
-      }
-
-      for i in index..buffer.len() {
-          if buffer[i] == b'\n' {
-              return Some(i);
-          }
-      }
-
-      None
-  }
-  ```
-
-### 4. Parsing and Aggregation
-
-- **Temperature Parsing:** Utilizes the `fast_float` crate to convert temperature byte slices to `f64` values rapidly through the `parse_temp` function.
-
-  ```rust
-  fn parse_temp(bytes: &[u8]) -> Option<f64> {
-      fast_parse_float(bytes).ok()
-  }
-  ```
-
-- **Chunk Processing:** The `process_chunk` function iterates through each line within a chunk, parsing the station name and temperature, and aggregates the data using a local `FxHashMap`.
-
-  ```rust
-  fn process_chunk<'a>(chunk: &'a [u8]) -> fxhash::FxHashMap<&'a [u8], Records> {
-      let mut map: fxhash::FxHashMap<&'a [u8], Records> = fxhash::FxHashMap::default();
-
-      let mut start = 0;
-      let len = chunk.len();
-
-      while start < len {
-          let end = match find_next_newline_simd(&chunk[start..]) {
-              Some(pos) => start + pos,
-              None => len,
-          };
-
-          let line = &chunk[start..end];
-          if let Some(pos) = memchr::memchr(b';', line) {
-              let station = &line[..pos];
-              let temp_bytes = &line[pos + 1..];
-
-              if let Some(temp) = parse_temp(temp_bytes) {
-                  map.entry(station)
-                      .and_modify(|e| e.update(temp))
-                      .or_insert_with(|| Records::new(temp));
-              }
-          }
-
-          start = end + 1;
-      }
-
-      map
-  }
-  ```
-
-### 5. Concurrent Data Aggregation
-
-- **Global Aggregation Map:** An `Arc<Mutex<HashMap<String, Records, FxBuildHasher>>>` serves as the thread-safe global hash map for aggregating results from all threads.
-
-  ```rust
-  let global_map = Arc::new(Mutex::new(HashMap::with_hasher(FxBuildHasher::default())));
-  ```
-
-- **Merging Local Maps:** Each thread maintains a local `FxHashMap` during chunk processing. After processing, the local map is merged into the global map within a mutex-protected block to ensure thread safety.
-
-  ```rust
-  let mut global_map = global_map.lock().unwrap();
-  for (station_bytes, records) in local_map {
-      let station = String::from_utf8_lossy(station_bytes).to_string();
-      global_map
-          .entry(station)
-          .and_modify(|e: &mut Records| e.merge(&records))
-          .or_insert(records);
-  }
-  ```
-
-### 6. Memory Allocation with Jemalloc
-
-- **Allocator Configuration:** Integrates `tikv_jemallocator` as the global memory allocator to optimize allocation patterns, particularly beneficial for the high-throughput, multi-threaded nature of the application.
-
-  ```rust
-  #[cfg(not(target_env = "msvc"))]
-  use tikv_jemallocator::Jemalloc;
-
-  #[cfg(not(target_env = "msvc"))]
-  #[global_allocator]
-  static GLOBAL: Jemalloc = Jemalloc;
-  ```
-
-### 7. Processing Workflow
-
-1. **File Initialization:** Opens `measurements.txt` and retrieves its size to determine the total number of chunks.
-2. **Thread Spawning:** Creates threads equal to the number of CPU cores available.
-3. **Chunk Reading:** Each thread reads assigned chunks with overlap handling to ensure complete line reads.
-4. **Line Parsing:** Utilizes SIMD-optimized newline detection to identify and parse each line within the chunk.
-5. **Data Aggregation:** Updates local `FxHashMap` instances with temperature statistics for each station.
-6. **Global Aggregation:** Merges local maps into the global hash map under mutex protection.
-7. **Result Compilation:** After all chunks are processed, the program sorts station names alphabetically and outputs the aggregated statistics.
+Flamegraph from the earlier 0.2818 s version.

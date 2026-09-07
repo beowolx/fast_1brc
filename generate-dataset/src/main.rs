@@ -1,10 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::sync::Arc;
-
-use crossbeam::channel;
-use fastrand::Rng;
-use rayon::prelude::*;
+use std::io::{self, Write};
 
 const CITY_DATA: &[(&str, f64)] = &[
     ("Abha", 18.0),
@@ -421,67 +416,97 @@ const CITY_DATA: &[(&str, f64)] = &[
     ("Ürümqi", 7.4),
     ("İzmir", 17.9),
 ];
-const CITY_COUNT: usize = CITY_DATA.len();
-const STANDARD_DEVIATION: f64 = 10.0;
-const BUFFER_CAPACITY: usize = 1000;
+fn generate(mut output: impl Write, rows: u64, mut seed: u64) -> io::Result<()> {
+    let centers: Vec<i16> = CITY_DATA
+        .iter()
+        .map(|(_, mean)| (mean * 10.0).round() as i16)
+        .collect();
+    let temperatures: Vec<Vec<u8>> = (-999_i16..=999)
+        .map(|value| {
+            let sign = if value < 0 { "-" } else { "" };
+            let absolute = value.abs();
+            format!("{sign}{}.{}\n", absolute / 10, absolute % 10).into_bytes()
+        })
+        .collect();
+    let mut buffer = Vec::with_capacity(1024 * 1024);
+    for row in 0..rows {
+        // SplitMix64.
+        seed = seed.wrapping_add(0x9e3779b97f4a7c15);
+        let mut random = seed;
+        random = (random ^ (random >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        random = (random ^ (random >> 27)).wrapping_mul(0x94d049bb133111eb);
+        random ^= random >> 31;
+        let station = (((random & 0xffff_ffff) * CITY_DATA.len() as u64) >> 32) as usize;
+        let noise = (((random >> 32) * 201) >> 32) as i16 - 100;
+        let temperature = (centers[station] + noise).clamp(-999, 999);
+        buffer.extend_from_slice(CITY_DATA[station].0.as_bytes());
+        buffer.push(b';');
+        buffer.extend_from_slice(&temperatures[(temperature + 999) as usize]);
+        if row % 32768 == 32767 {
+            output.write_all(&buffer)?;
+            buffer.clear();
+        }
+    }
+    output.write_all(&buffer)?;
+    output.flush()
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = std::time::Instant::now();
-
-    let number = std::env::args()
-        .nth(1)
-        .expect("usage: generate-dataset <number-of-lines>")
-        .parse::<usize>()?;
-
-    let (sender, receiver) = channel::bounded::<Vec<u8>>(100);
-    let writer_handle = std::thread::spawn(move || -> std::io::Result<()> {
-        let measurements_file = File::create("measurements.txt")?;
-        let mut measurements_file = BufWriter::new(measurements_file);
-        for data in receiver.iter() {
-            if data.is_empty() {
-                break;
-            }
-            measurements_file.write_all(&data)?;
-        }
-        measurements_file.flush()?;
-        Ok(())
-    });
-
-    let city_data = Arc::new(CITY_DATA);
-
-    (0..number)
-        .into_par_iter()
-        .fold(
-            || {
-                let rng = Rng::new();
-                let buffer = Vec::with_capacity(BUFFER_CAPACITY * 20);
-                (rng, buffer)
-            },
-            |(mut rng, mut buffer), _| {
-                let random_city_index = rng.usize(0..CITY_COUNT);
-                let (city, temperature) = city_data[random_city_index];
-                let measurement = temperature + (rng.f64() * 2.0 - 1.0) * STANDARD_DEVIATION;
-
-                buffer.extend_from_slice(format!("{};{:.1}\n", city, measurement).as_bytes());
-
-                if buffer.len() >= BUFFER_CAPACITY * 20 {
-                    sender.send(std::mem::take(&mut buffer)).unwrap();
-                }
-
-                (rng, buffer)
-            },
-        )
-        .for_each(|(_, mut buffer)| {
-            if !buffer.is_empty() {
-                sender.send(std::mem::take(&mut buffer)).unwrap();
-            }
-        });
-
-    sender.send(Vec::new()).unwrap();
-
-    writer_handle.join().unwrap()?;
-
-    println!("Generated {} lines in {:?}", number, start_time.elapsed());
-
+    const USAGE: &str = "usage: generate-dataset <rows> [output-path] [seed]";
+    let mut arguments = std::env::args_os().skip(1);
+    let rows = arguments
+        .next()
+        .ok_or(USAGE)?
+        .to_str()
+        .ok_or(USAGE)?
+        .parse::<u64>()?;
+    let path = arguments
+        .next()
+        .unwrap_or_else(|| "measurements.txt".into());
+    let seed = match arguments.next() {
+        Some(value) => value.to_str().ok_or(USAGE)?.parse::<u64>()?,
+        None => 1,
+    };
+    if arguments.next().is_some() {
+        return Err(USAGE.into());
+    }
+    let start = std::time::Instant::now();
+    let output = File::create_new(&path)?;
+    generate(output, rows, seed)?;
+    eprintln!(
+        "Generated {rows} lines in {:?} (seed {seed})",
+        start.elapsed()
+    );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{generate, CITY_DATA};
+
+    #[test]
+    fn deterministic_canonical_rows_across_buffer_boundary() {
+        let mut first = Vec::new();
+        let mut repeated = Vec::new();
+        generate(&mut first, 40_000, 0).unwrap();
+        generate(&mut repeated, 40_000, 0).unwrap();
+        assert_eq!(first, repeated);
+        let text = std::str::from_utf8(&first).unwrap();
+        assert_eq!(text.lines().count(), 40_000);
+        assert!(text.ends_with('\n'));
+        for line in text.lines() {
+            let (station, temperature) = line.split_once(';').unwrap();
+            let mean = CITY_DATA.iter().find(|entry| entry.0 == station).unwrap().1;
+            let value = temperature.parse::<f64>().unwrap();
+            assert!((-99.9..=99.9).contains(&value));
+            assert!((value - (mean * 10.0).round() / 10.0).abs() < 10.000_001);
+            assert_eq!(temperature, format!("{value:.1}"));
+        }
+        let mut different = Vec::new();
+        generate(&mut different, 40_000, 1).unwrap();
+        assert_ne!(first, different);
+        let mut empty = Vec::new();
+        generate(&mut empty, 0, 1).unwrap();
+        assert!(empty.is_empty());
+    }
 }
